@@ -1227,6 +1227,10 @@ export class DxfScene {
         const layer = this._GetEntityLayer(entity, blockCtx)
         const color = this._GetEntityColor(entity, blockCtx)
 
+        const dimAsz = this.vars.get("DIMASZ") ?? 2.5
+        const dimScale = this.vars.get("DIMSCALE") ?? 1.0
+        const arrowLen = Math.max(dimAsz * dimScale, 0)
+
         // Path: emit consecutive segments as one LINE_SEGMENTS entity (pairs).
         const pathVerts = []
         for (let i = 0; i < verts.length - 1; i++) {
@@ -1243,6 +1247,48 @@ export class DxfScene {
             })
         }
 
+        // Hookline (group 75 = on): a short horizontal segment at the
+        // annotation end, along `horizontalDirection` (group 211/221/231).
+        // AutoCAD will sometimes encode this as the last vertex pair already;
+        // sometimes the flag is set without a corresponding vertex (CADMATIC
+        // exports tend to do the latter). Skip synthesis if the existing last
+        // segment is already (anti-)parallel to horizontalDirection so we
+        // don't double-draw.
+        if (entity.hookline === true && entity.horizontalDirection &&
+            arrowLen > 0 && verts.length >= 1) {
+            const hd = entity.horizontalDirection
+            const hdLen = Math.hypot(hd.x, hd.y)
+            if (hdLen > 1e-12) {
+                const hux = hd.x / hdLen
+                const huy = hd.y / hdLen
+                let alreadyHooked = false
+                if (verts.length >= 2) {
+                    const a = verts[verts.length - 2]
+                    const b = verts[verts.length - 1]
+                    const ldx = b.x - a.x
+                    const ldy = b.y - a.y
+                    const llen = Math.hypot(ldx, ldy)
+                    if (llen > 1e-12) {
+                        // |dot| > ~0.999 ⇒ within ~2.5° of horizontalDirection.
+                        const dot = Math.abs((ldx * hux + ldy * huy) / llen)
+                        if (dot > 0.999) alreadyHooked = true
+                    }
+                }
+                if (!alreadyHooked) {
+                    const last = verts[verts.length - 1]
+                    yield new Entity({
+                        type: Entity.Type.LINE_SEGMENTS,
+                        vertices: [
+                            {x: last.x, y: last.y},
+                            {x: last.x + hux * arrowLen,
+                             y: last.y + huy * arrowLen}
+                        ],
+                        layer, color, lineType: 0
+                    })
+                }
+            }
+        }
+
         // Arrowhead (filled triangle) at the first vertex pointing along the
         // first segment direction.
         if (entity.arrowEnabled === false) return
@@ -1257,9 +1303,6 @@ export class DxfScene {
         const px = -uy
         const py = ux
 
-        const dimAsz = this.vars.get("DIMASZ") ?? 2.5
-        const dimScale = this.vars.get("DIMSCALE") ?? 1.0
-        const arrowLen = Math.max(dimAsz * dimScale, 0)
         if (arrowLen <= 0) return
         // Cap arrowhead at the first-segment length so the arrow never
         // overshoots its own leader segment on tiny callouts.
