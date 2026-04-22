@@ -244,10 +244,9 @@ export class DxfScene {
                    entity.type === "ATTRIB"
         }
 
-        /* Should return false if unable to resolve some characters, true otherwise. */
         const ProcessEntity = async (entity) => {
             if (!this._FilterEntity(entity)) {
-                return true
+                return
             }
             let ret
             if (entity.type === "TEXT" || entity.type === "ATTRIB" || entity.type === "ATTDEF") {
@@ -292,7 +291,7 @@ export class DxfScene {
                     /* Failing to resolve some character means that all fonts have been loaded and
                      * checked. No mean to check the rest strings. However until it is encountered,
                      * all strings should be checked, even if all fonts already loaded. This needed
-                     * to properly set `hasMissingChars` which allows displaying some warning in a
+                     * to properly set hasMissingChars which allows displaying some warning in a
                      * viewer.
                      */
                     return
@@ -355,6 +354,9 @@ export class DxfScene {
             break
         case "DIMENSION":
             renderEntities = this._DecomposeDimension(entity, blockCtx)
+            break
+        case "LEADER":
+            renderEntities = this._DecomposeLeader(entity, blockCtx)
             break
         case "ATTRIB":
             renderEntities = this._DecomposeAttribute(entity, blockCtx)
@@ -1195,6 +1197,89 @@ export class DxfScene {
                 })
             }
         }
+    }
+
+    /**
+     * Decompose a legacy LEADER entity into renderable primitives.
+     *
+     * LEADER vertices are ordered from the arrowhead (vertices[0]) toward the
+     * annotation (vertices[n-1]). Render output:
+     *   - A LINE_SEGMENTS run for the polyline path connecting the vertices.
+     *   - A filled TRIANGLES arrowhead at vertices[0] aligned along the first
+     *     segment (vertices[0] -> vertices[1]) when arrowEnabled and the
+     *     first segment has non-zero length.
+     *
+     * Spline-path leaders (pathType === 1) and the associated annotation
+     * (MText/Tolerance/Block at the tail) are NOT synthesised here — the
+     * tail-side annotation is already a separate entity in the DXF and will
+     * be rendered by its own handler. Spline paths fall back to the straight
+     * polyline approximation through the control points (matches what most
+     * CAD viewers do when they don't have full leader-style support).
+     *
+     * Arrowhead size: $DIMASZ × $DIMSCALE (defaults 2.5 × 1.0). Width-to-length
+     * ratio uses AutoCAD's default closed-filled arrow (1:3 base:length, so
+     * half-width = arrowLen / 6).
+     */
+    *_DecomposeLeader(entity, blockCtx) {
+        const verts = entity.vertices
+        if (!verts || verts.length < 2) return
+
+        const layer = this._GetEntityLayer(entity, blockCtx)
+        const color = this._GetEntityColor(entity, blockCtx)
+
+        // Path: emit consecutive segments as one LINE_SEGMENTS entity (pairs).
+        const pathVerts = []
+        for (let i = 0; i < verts.length - 1; i++) {
+            pathVerts.push({x: verts[i].x, y: verts[i].y})
+            pathVerts.push({x: verts[i + 1].x, y: verts[i + 1].y})
+        }
+        if (pathVerts.length >= 2) {
+            yield new Entity({
+                type: Entity.Type.LINE_SEGMENTS,
+                vertices: pathVerts,
+                layer,
+                color,
+                lineType: 0
+            })
+        }
+
+        // Arrowhead (filled triangle) at the first vertex pointing along the
+        // first segment direction.
+        if (entity.arrowEnabled === false) return
+        const tip = verts[0]
+        const next = verts[1]
+        const dx = next.x - tip.x
+        const dy = next.y - tip.y
+        const len = Math.hypot(dx, dy)
+        if (len < 1e-12) return
+        const ux = dx / len
+        const uy = dy / len
+        const px = -uy
+        const py = ux
+
+        const dimAsz = this.vars.get("DIMASZ") ?? 2.5
+        const dimScale = this.vars.get("DIMSCALE") ?? 1.0
+        const arrowLen = Math.max(dimAsz * dimScale, 0)
+        if (arrowLen <= 0) return
+        // Cap arrowhead at the first-segment length so the arrow never
+        // overshoots its own leader segment on tiny callouts.
+        const al = Math.min(arrowLen, len)
+        const halfW = al / 6  // 1:3 base:length closed-filled arrow
+
+        const baseCx = tip.x + ux * al
+        const baseCy = tip.y + uy * al
+        const triVerts = [
+            {x: tip.x, y: tip.y},
+            {x: baseCx + px * halfW, y: baseCy + py * halfW},
+            {x: baseCx - px * halfW, y: baseCy - py * halfW}
+        ]
+        yield new Entity({
+            type: Entity.Type.TRIANGLES,
+            vertices: triVerts,
+            indices: [0, 1, 2],
+            layer,
+            color
+        })
     }
 
 
