@@ -92,6 +92,10 @@ export class DxfScene {
         /** Indexed by variable name (without leading '$'). */
         this.vars = new Map()
         this.fontStyles = new Map()
+        /* Indexed by linetype name, value is linetype object from parsed
+         * DXF (carries pattern[] and patternLength from the LTYPE table).
+         * Populated in Build() when tables.lineType is present. */
+        this.lineTypes = new Map()
         /* Indexed by entity handle. */
         this.inserts = new Map()
         this.bounds = null
@@ -121,6 +125,11 @@ export class DxfScene {
         this.angDir = this.vars.get("ANGDIR") ?? 0
         this.pdMode = this.vars.get("PDMODE") ?? 0
         this.pdSize = this.vars.get("PDSIZE") ?? 0
+        // Global linetype scale. Dashed / dotted pattern subdivision in
+        // _ApplyLinetypePattern multiplies the pattern by (entity-level
+        // lineTypeScale) × ($LTSCALE) so dashes stay at the proportional
+        // size CADS shows at the sheet's plot scale.
+        this.ltScale = this.vars.get("LTSCALE") ?? 1.0
         this.isMetric = (this.vars.get("MEASUREMENT") ?? 1) == 1
 
         if(dxf.tables && dxf.tables.layer) {
@@ -139,6 +148,15 @@ export class DxfScene {
         if (dxf.tables && dxf.tables.style) {
             for (const [, style] of Object.entries(dxf.tables.style.styles)) {
                 this.fontStyles.set(style.styleName, style);
+            }
+        }
+
+        if (dxf.tables && dxf.tables.lineType && dxf.tables.lineType.lineTypes) {
+            for (const [name, lt] of Object.entries(dxf.tables.lineType.lineTypes)) {
+                this.lineTypes.set(name, lt)
+                // Also index by upper-case so case-insensitive lookups
+                // (CONTINUOUS vs Continuous) resolve the same entry.
+                this.lineTypes.set(name.toUpperCase(), lt)
             }
         }
 
@@ -382,15 +400,132 @@ export class DxfScene {
      * @return {number}
      */
     _GetLineType(entity, vertex = null, blockCtx = null) {
-        //XXX lookup
-        return 0
+        // Returns a stable numeric ID that groups entities with the same
+        // dash pattern into a single batch. 0 means "continuous" (no
+        // pattern). Non-zero IDs are interned from the resolved pattern so
+        // the batching layer distinguishes DASHED from DOTTED etc.
+        const name = entity?.lineType
+        if (!name) return 0
+        const lt = this._ResolveLineType(name)
+        if (!lt || !lt.pattern || lt.pattern.length === 0) return 0
+        return this._InternLineTypeId(lt)
     }
 
-    /** Check if start/end with are not specified. */
+    /** Resolve a linetype name (case-insensitive) to its table entry with
+     * pattern[] + patternLength, or null for unknown / Continuous. */
+    _ResolveLineType(name) {
+        if (!name) return null
+        if (name === 'BYLAYER' || name === 'BYBLOCK' ||
+            name === 'ByLayer' || name === 'ByBlock' ||
+            name === 'CONTINUOUS' || name === 'Continuous') return null
+        return this.lineTypes.get(name) || this.lineTypes.get(name.toUpperCase()) || null
+    }
+
+    /** Map linetype objects to stable integer IDs for batch-key grouping. */
+    _InternLineTypeId(lt) {
+        if (!this._lineTypeIds) {
+            this._lineTypeIds = new Map()
+            this._lineTypeNextId = 1
+        }
+        let id = this._lineTypeIds.get(lt)
+        if (!id) {
+            id = this._lineTypeNextId++
+            this._lineTypeIds.set(lt, id)
+        }
+        return id
+    }
+
+    /** Walk a sequence of 2D segments (straight runs between consecutive
+     * vertex pairs) and split each by the given DXF dash pattern so the
+     * renderer's plain-line path produces the dash/gap layout without
+     * shader support. Pattern values: +x = visible dash of length x,
+     * -x = invisible gap of length x, 0 = zero-length dot (rendered as a
+     * very short dash). Output is an array of {x,y}[] sub-polyline arrays,
+     * each a solid-drawn run.
+     *
+     * ltScale lets per-entity 48 or global $LTSCALE overrides tune the
+     * pattern length; default 1.0. */
+    _ApplyLinetypePattern(vertices, pattern, ltScale = 1.0) {
+        if (!pattern || pattern.length === 0) return [vertices]
+        // Normalise pattern: DOTTED's zero-length dash becomes a tiny dot
+        // so it still renders as a visible pixel.
+        const DOT_LEN = 0.01
+        const scaled = pattern.map(v => (v === 0 ? DOT_LEN : v * ltScale))
+        const totalLen = scaled.reduce((s, v) => s + Math.abs(v), 0)
+        if (totalLen <= 0) return [vertices]
+
+        const runs = []
+        let curRun = null
+        const openRun = (x, y) => { curRun = [{x, y}] }
+        const closeRun = () => {
+            if (curRun && curRun.length >= 2) runs.push(curRun)
+            curRun = null
+        }
+
+        // Per-segment pattern reset — matches AutoCAD's default (PLINEGEN=0)
+        // and CADMATIC's visual output: each vertex-to-vertex segment starts
+        // the pattern fresh with the first dash, and any partial pattern
+        // element at the segment end is truncated. This avoids the case
+        // where the pattern cycle's running state drifts into a gap at the
+        // end of a closed polyline, making the last (left) edge of an
+        // ATTRIB rectangle disappear entirely.
+        for (let i = 1; i < vertices.length; i++) {
+            let ax = vertices[i - 1].x
+            let ay = vertices[i - 1].y
+            const bx = vertices[i].x
+            const by = vertices[i].y
+            const dx = bx - ax
+            const dy = by - ay
+            let remaining = Math.hypot(dx, dy)
+            if (remaining < 1e-12) continue
+            const ux = dx / remaining
+            const uy = dy / remaining
+
+            // Fresh pattern cycle per segment.
+            let patIdx = 0
+            let patRem = Math.abs(scaled[0])
+            let patVisible = scaled[0] > 0 || scaled[0] === 0
+
+            if (patVisible) openRun(ax, ay)
+
+            while (remaining > 1e-12) {
+                if (patRem >= remaining - 1e-12) {
+                    if (patVisible) {
+                        if (!curRun) openRun(ax, ay)
+                        curRun.push({x: bx, y: by})
+                    }
+                    patRem -= remaining
+                    remaining = 0
+                } else {
+                    const stepX = ax + ux * patRem
+                    const stepY = ay + uy * patRem
+                    if (patVisible) {
+                        if (!curRun) openRun(ax, ay)
+                        curRun.push({x: stepX, y: stepY})
+                        closeRun()
+                    }
+                    remaining -= patRem
+                    ax = stepX
+                    ay = stepY
+                    patIdx = (patIdx + 1) % scaled.length
+                    patRem = Math.abs(scaled[patIdx])
+                    patVisible = scaled[patIdx] > 0 || scaled[patIdx] === 0
+                    if (patVisible && remaining > 1e-12) openRun(ax, ay)
+                }
+            }
+            // Truncate any trailing visible partial dash at the segment
+            // vertex — closeRun defensively in case the final dash didn't
+            // consume the full remaining length (patRem > 0 when loop
+            // exits via the ">=" branch).
+            closeRun()
+        }
+        return runs
+    }
+
+    /** Check if start/end widths are not specified on this vertex. */
     _IsPlainLine(entity) {
-        //XXX until shaped polylines rendering implemented
-        return true
-        // return !Boolean(entity.startWidth || entity.endWidth)
+        // `entity` here is a vertex object (see _DecomposePolyline).
+        return !Boolean(entity.startWidth || entity.endWidth)
     }
 
     *_DecomposeLine(entity, blockCtx) {
@@ -400,6 +535,28 @@ export class DxfScene {
         }
         const layer = this._GetEntityLayer(entity, blockCtx)
         const color = this._GetEntityColor(entity, blockCtx)
+        // Dashed / dotted rendering — see _DecomposePolyline for the same
+        // CPU-side pattern subdivision.
+        const lt = this._ResolveLineType(entity.lineType)
+        if (lt?.pattern?.length > 0) {
+            const entLt = (typeof entity.lineTypeScale === 'number' && entity.lineTypeScale > 0)
+                ? entity.lineTypeScale : 1.0
+            const runs = this._ApplyLinetypePattern(entity.vertices, lt.pattern, entLt * this.ltScale)
+            for (const run of runs) {
+                if (run.length < 2) continue
+                // Emit each solid sub-run as its own LINE_SEGMENTS entity
+                // (two vertices per segment).
+                for (let i = 0; i < run.length - 1; i++) {
+                    yield new Entity({
+                        type: Entity.Type.LINE_SEGMENTS,
+                        vertices: [run[i], run[i + 1]],
+                        layer, color,
+                        lineType: 0,
+                    })
+                }
+            }
+            return
+        }
         yield new Entity({
             type: Entity.Type.LINE_SEGMENTS,
             vertices: entity.vertices,
@@ -1599,25 +1756,109 @@ export class DxfScene {
     }
 
     /**
-     * Generate entities for shaped polyline (e.g. line resulting in mesh). All segments are shaped
-     * (have start/end width). Segments may be bulge.
-     * @param vertices
+     * Generate entities for shaped polyline (wide / tapered strokes). Converts
+     * the vertex list into a triangle strip by offsetting each segment's
+     * endpoints perpendicular to its direction by half the segment width.
+     *
+     * DXF width convention: a vertex's `startWidth` is the width at the START
+     * of the segment leaving this vertex, `endWidth` is the width at its END.
+     * For closed polylines the last vertex's segment wraps back to the first.
+     * Zero / missing widths fall back to the next vertex's width so a
+     * pline-level taper defined only on one endpoint still renders.
+     *
+     * @param vertices  Vertex list; each vertex carries optional startWidth /
+     *                  endWidth / bulge.
      * @param layer
      * @param color
-     * @param lineType
-     * @param shape {Boolean} True if closed polyline.
+     * @param lineType  Retained for signature compatibility — shaped fills use
+     *                  the stroke colour, line type patterns don't apply.
+     * @param shape {Boolean} True if closed polyline (last→first segment).
      * @return {Generator<Entity>}
      */
     *_GenerateShapedPolyline(vertices, layer, color, lineType, shape) {
-        //XXX
+        const n = vertices.length
+        if (n < 2) return
+
+        // Flatten bulges to straight segments for now. Bulged shaped
+        // polylines are rare in CADS output; re-use _GenerateBulgeVertices
+        // upstream if / when that changes.
+        const segs = []
+        for (let i = 0; i < n - 1; i++) {
+            segs.push([vertices[i], vertices[i + 1]])
+        }
+        if (shape) {
+            segs.push([vertices[n - 1], vertices[0]])
+        }
+
+        // Pick up segment widths. `startWidth` on the vertex applies to the
+        // segment leaving it. Fall back to endWidth or the neighbour's width
+        // so a single annotated endpoint still produces a visible stroke.
+        function widthAt(v) {
+            const sw = typeof v.startWidth === 'number' ? v.startWidth : null
+            const ew = typeof v.endWidth === 'number' ? v.endWidth : null
+            return { sw, ew }
+        }
+
+        const allVerts = []
+        const indices = []
+
+        for (const [a, b] of segs) {
+            const aw = widthAt(a)
+            const bw = widthAt(b)
+            // Start width = a.startWidth (or fall back to a.endWidth or b.startWidth).
+            // End width = b.startWidth (the NEXT segment's start is this segment's end).
+            //   When unavailable, fall back to b.endWidth or a.endWidth.
+            let startW = aw.sw != null ? aw.sw : aw.ew != null ? aw.ew : bw.sw
+            let endW = bw.sw != null ? bw.sw : bw.ew != null ? bw.ew : aw.ew
+            if (!startW || !endW) {
+                // No usable width on either endpoint — skip this segment
+                // (upstream splitter usually catches this by checking
+                // _IsPlainLine, but handle it defensively).
+                continue
+            }
+
+            const dx = b.x - a.x
+            const dy = b.y - a.y
+            const len = Math.hypot(dx, dy)
+            if (len < 1e-12) continue
+            // Unit perpendicular pointing to the "left" of segment direction.
+            const px = -dy / len
+            const py = dx / len
+            // Global width scale lets the viewer thin shaped polylines
+            // so they don't visually dominate 1-pixel hairlines. Set
+            // sceneOptions.shapedLineWidthScale in [0..1] on the viewer
+            // (default 1.0 = exact drawing-unit width).
+            const wScale = (typeof this.options?.shapedLineWidthScale === 'number' &&
+                this.options.shapedLineWidthScale > 0)
+                ? this.options.shapedLineWidthScale : 1.0
+            const hs = startW * 0.5 * wScale
+            const he = endW * 0.5 * wScale
+
+            const i0 = allVerts.length
+            allVerts.push(
+                { x: a.x + px * hs, y: a.y + py * hs },  // top-left
+                { x: a.x - px * hs, y: a.y - py * hs },  // bottom-left
+                { x: b.x + px * he, y: b.y + py * he },  // top-right
+                { x: b.x - px * he, y: b.y - py * he }   // bottom-right
+            )
+            // Two triangles per segment (TL, BL, TR) and (BL, BR, TR).
+            indices.push(i0, i0 + 1, i0 + 2, i0 + 1, i0 + 3, i0 + 2)
+        }
+
+        if (indices.length === 0) {
+            // Fall back to a plain polyline outline so the geometry doesn't
+            // disappear entirely when widths can't be resolved.
+            yield new Entity({
+                type: Entity.Type.POLYLINE,
+                vertices, layer, color, lineType, shape
+            })
+            return
+        }
+
         yield new Entity({
-                             type: Entity.Type.POLYLINE,
-                             vertices,
-                             layer,
-                             color,
-                             lineType,
-                             shape
-                         })
+            type: Entity.Type.TRIANGLES,
+            vertices: allVerts, indices, layer, color
+        })
     }
 
     /** Mirror entity vertices if necessary in case of extrusionDirection with negative Z specified.
@@ -1668,6 +1909,35 @@ export class DxfScene {
         if (verticesCount < 2) {
             return
         }
+        // Normalise widths onto every vertex so the splitter below (which
+        // calls _IsPlainLine per-vertex) keeps the whole polyline in the
+        // shaped branch instead of fragmenting wherever an intermediate
+        // vertex happens to have no explicit width. DXF's per-vertex
+        // convention puts startWidth only on the segment's starting vertex;
+        // downstream vertices legitimately carry no width even though they
+        // should still render with the same thickness.
+        //   1. If entity has group 43 width, use it as the default.
+        //   2. Otherwise if ANY vertex carries width, use that max as
+        //      the default for unannotated vertices.
+        // Clone vertices before mutating to avoid aliasing upstream refs.
+        const entityWidth = typeof entity.width === 'number' && entity.width > 0
+            ? entity.width : 0
+        let fallbackWidth = entityWidth
+        if (!fallbackWidth) {
+            for (const v of entityVertices) {
+                const w = Math.max(v.startWidth || 0, v.endWidth || 0)
+                if (w > fallbackWidth) fallbackWidth = w
+            }
+        }
+        if (fallbackWidth > 0) {
+            entityVertices = entityVertices.map(v => {
+                const sw = typeof v.startWidth === 'number' && v.startWidth > 0
+                    ? v.startWidth : fallbackWidth
+                const ew = typeof v.endWidth === 'number' && v.endWidth > 0
+                    ? v.endWidth : fallbackWidth
+                return { ...v, startWidth: sw, endWidth: ew }
+            })
+        }
         entityVertices = this._MirrorEntityVertices(entity, entityVertices)
         const color = this._GetEntityColor(entity, blockCtx)
         const layer = this._GetEntityLayer(entity, blockCtx)
@@ -1704,12 +1974,37 @@ export class DxfScene {
             }
 
             if (curPlainLine) {
-                yield new Entity({
-                                     type: Entity.Type.POLYLINE,
-                                     vertices, layer, color,
-                                     lineType: curLineType,
-                                     shape: isClosed
-                                 })
+                // Dashed/dotted rendering: the library's WebGL pipeline
+                // draws every POLYLINE solid, so to get dashes we slice
+                // the vertex list into solid sub-runs on the CPU using the
+                // resolved LINETYPE pattern.
+                const ltName = entity?.lineType
+                const lt = _this._ResolveLineType(ltName)
+                const pat = lt?.pattern
+                if (pat && pat.length > 0) {
+                    const looped = isClosed && vertices.length > 0 &&
+                        (vertices[0] !== vertices[vertices.length - 1])
+                        ? [...vertices, vertices[0]]
+                        : vertices
+                    const entLt = (typeof entity.lineTypeScale === 'number' && entity.lineTypeScale > 0)
+                        ? entity.lineTypeScale : 1.0
+                    const runs = _this._ApplyLinetypePattern(looped, pat, entLt * _this.ltScale)
+                    for (const run of runs) {
+                        yield new Entity({
+                            type: Entity.Type.POLYLINE,
+                            vertices: run, layer, color,
+                            lineType: 0,
+                            shape: false
+                        })
+                    }
+                } else {
+                    yield new Entity({
+                                         type: Entity.Type.POLYLINE,
+                                         vertices, layer, color,
+                                         lineType: curLineType,
+                                         shape: isClosed
+                                     })
+                }
             } else {
                 yield* _this._GenerateShapedPolyline(vertices, layer, color, curLineType, isClosed)
             }
