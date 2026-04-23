@@ -1045,7 +1045,9 @@ export class DxfScene {
     }
 
     *_DecomposeMText(entity, blockCtx) {
+        const isDebug = typeof entity?.text === 'string' && entity.text.includes('VRF1-S2')
         if (!this.textRenderer.canRender) {
+            if (isDebug) console.log('[MTEXT DEBUG] VRF1-S2 skipped: canRender=false')
             return
         }
         const layer = this._GetEntityLayer(entity, blockCtx)
@@ -1054,7 +1056,21 @@ export class DxfScene {
         const fixedHeight = style?.fixedTextHeight === 0 ? null : style?.fixedTextHeight
         const parser = new MTextFormatParser()
         parser.Parse(ParseSpecialChars(entity.text))
-        yield* this.textRenderer.RenderMText({
+        if (isDebug) {
+            console.log('[MTEXT DEBUG] VRF1-S2 attempting render', {
+                layer, color, style,
+                fontSize: entity.height ?? fixedHeight,
+                position: entity.position,
+                rotation: entity.rotation,
+                direction: entity.direction,
+                attachment: entity.attachmentPoint,
+                width: entity.width,
+                parsedContent: parser.GetContent(),
+                fontsLoaded: this.textRenderer.fonts?.length,
+            })
+        }
+        let count = 0
+        for (const e of this.textRenderer.RenderMText({
             formattedText: parser.GetContent(),
             // May still be overwritten by inline formatting codes
             fontSize: entity.height ?? fixedHeight,
@@ -1065,7 +1081,11 @@ export class DxfScene {
             lineSpacing: entity.lineSpacing,
             width: entity.width,
             color, layer
-        })
+        })) {
+            count++
+            yield e
+        }
+        if (isDebug) console.log(`[MTEXT DEBUG] VRF1-S2 produced ${count} render entities`)
     }
 
     /**
