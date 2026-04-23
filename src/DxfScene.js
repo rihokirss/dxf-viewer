@@ -244,9 +244,17 @@ export class DxfScene {
                    entity.type === "ATTRIB"
         }
 
+        /* Should return false if unable to resolve some characters, true otherwise.
+         * Must return true (not undefined) for filtered entities so the caller's
+         * `!await ProcessEntity(entity)` check doesn't bail the whole fetch loop
+         * when the first text-like entity happens to be hidden / frozen /
+         * paper-space-suppressed. Previously regressed during LEADER support
+         * work (a7ad348) — symptom: fonts never loaded because the first text
+         * entity in the file was filtered, so canRender stayed false and every
+         * subsequent MTEXT was silently dropped. */
         const ProcessEntity = async (entity) => {
             if (!this._FilterEntity(entity)) {
-                return
+                return true
             }
             let ret
             if (entity.type === "TEXT" || entity.type === "ATTRIB" || entity.type === "ATTDEF") {
@@ -1045,9 +1053,7 @@ export class DxfScene {
     }
 
     *_DecomposeMText(entity, blockCtx) {
-        const isDebug = typeof entity?.text === 'string' && entity.text.includes('VRF1-S2')
         if (!this.textRenderer.canRender) {
-            if (isDebug) console.log('[MTEXT DEBUG] VRF1-S2 skipped: canRender=false')
             return
         }
         const layer = this._GetEntityLayer(entity, blockCtx)
@@ -1056,21 +1062,7 @@ export class DxfScene {
         const fixedHeight = style?.fixedTextHeight === 0 ? null : style?.fixedTextHeight
         const parser = new MTextFormatParser()
         parser.Parse(ParseSpecialChars(entity.text))
-        if (isDebug) {
-            console.log('[MTEXT DEBUG] VRF1-S2 attempting render', {
-                layer, color, style,
-                fontSize: entity.height ?? fixedHeight,
-                position: entity.position,
-                rotation: entity.rotation,
-                direction: entity.direction,
-                attachment: entity.attachmentPoint,
-                width: entity.width,
-                parsedContent: parser.GetContent(),
-                fontsLoaded: this.textRenderer.fonts?.length,
-            })
-        }
-        let count = 0
-        for (const e of this.textRenderer.RenderMText({
+        yield* this.textRenderer.RenderMText({
             formattedText: parser.GetContent(),
             // May still be overwritten by inline formatting codes
             fontSize: entity.height ?? fixedHeight,
@@ -1081,11 +1073,7 @@ export class DxfScene {
             lineSpacing: entity.lineSpacing,
             width: entity.width,
             color, layer
-        })) {
-            count++
-            yield e
-        }
-        if (isDebug) console.log(`[MTEXT DEBUG] VRF1-S2 produced ${count} render entities`)
+        })
     }
 
     /**
