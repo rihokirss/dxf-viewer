@@ -1903,9 +1903,49 @@ export class DxfScene {
      * @param shape {Boolean} True if closed polyline (last→first segment).
      * @return {Generator<Entity>}
      */
-    *_GenerateShapedPolyline(vertices, layer, color, lineType, shape) {
+    *_GenerateShapedPolyline(vertices, layer, color, lineType, shape, entity = null) {
         const n = vertices.length
         if (n < 2) return
+
+        // Apply DXF LTYPE dash pattern to shaped polylines. The previous
+        // behaviour always emitted a solid stroke when any vertex carried
+        // a width annotation, regardless of the entity's lineType — so a
+        // DASHDOUBLEDOT polyline with 50 mm width (CADMATIC ITK_KILBIPIIR
+        // panel perimeters) rendered as an unbroken cyan loop. Split the
+        // centreline into solid sub-runs using _ApplyLinetypePattern,
+        // inject the uniform width onto each interpolated run vertex,
+        // then recurse to shape each run into triangles. The recursive
+        // call passes lineType=0 and entity=null so the pattern isn't
+        // re-applied.
+        if (entity && lineType !== 0) {
+            const lt = this._ResolveLineType(entity.lineType)
+            const pat = lt?.pattern
+            if (pat && pat.length > 0) {
+                let uniformW = 0
+                for (const v of vertices) {
+                    const w = Math.max(v.startWidth || 0, v.endWidth || 0)
+                    if (w > uniformW) uniformW = w
+                }
+                if (uniformW > 0) {
+                    const entLt = (typeof entity.lineTypeScale === 'number' && entity.lineTypeScale > 0)
+                        ? entity.lineTypeScale : 1.0
+                    const looped = shape && (vertices[0] !== vertices[n - 1])
+                        ? [...vertices, vertices[0]]
+                        : vertices
+                    const runs = this._ApplyLinetypePattern(looped, pat, entLt * this.ltScale)
+                    for (const run of runs) {
+                        if (run.length < 2) continue
+                        const withW = run.map(p => ({
+                            ...p,
+                            startWidth: uniformW,
+                            endWidth: uniformW,
+                        }))
+                        yield* this._GenerateShapedPolyline(withW, layer, color, 0, false, null)
+                    }
+                    return
+                }
+            }
+        }
 
         // Flatten bulges to straight segments for now. Bulged shaped
         // polylines are rare in CADS output; re-use _GenerateBulgeVertices
@@ -2134,7 +2174,7 @@ export class DxfScene {
                                      })
                 }
             } else {
-                yield* _this._GenerateShapedPolyline(vertices, layer, color, curLineType, isClosed)
+                yield* _this._GenerateShapedPolyline(vertices, layer, color, curLineType, isClosed, entity)
             }
 
             startIdx = endIdx
