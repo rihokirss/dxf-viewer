@@ -1813,6 +1813,39 @@ export class DxfScene {
      * @param blockCtx {?BlockContext} Nested block insert when non-null.
      */
     _ProcessInsert(entity, blockCtx = null) {
+        // INSERT → ATTRIB pass: CADS (and standard DXF) emit per-instance
+        // ATTRIBs as separate entities right after the INSERT, with group
+        // 66=1 on the INSERT and a trailing SEQEND. The internal
+        // DxfParser's INSERT handler reads group 10 via parsePoint which
+        // leaves the scanner positioned on the z coord; the outer while
+        // loop then advances past the following `0 ATTRIB` marker, eating
+        // the first sub-entity. The upshot: top-level ATTRIBs never land
+        // in dxf.entities — so title-block values on paper-space INSERTs
+        // (kirjanurk E_DRW_DRAWER / E_DRW_SCALE1 / …) vanish from the
+        // rendered scene.
+        //
+        // Work around without changing parser state flow: when an INSERT
+        // carries an `attribs` array already populated by the producing
+        // parser (our DRW→DXF pipeline attaches it on the entity
+        // directly), decompose each entry as an ATTRIB entity in its own
+        // right before the block body is flattened.
+        if (!blockCtx && Array.isArray(entity.attribs) && entity.attribs.length > 0) {
+            for (const attr of entity.attribs) {
+                if (!attr || typeof attr !== 'object') continue
+                if (attr.invisible || attr.hidden) continue
+                const attrEnt = {
+                    ...attr,
+                    type: 'ATTRIB',
+                    inPaperSpace: entity.inPaperSpace ?? attr.inPaperSpace,
+                    layer: attr.layer ?? entity.layer,
+                }
+                const gen = this._DecomposeAttribute(attrEnt, null)
+                for (const re of gen) {
+                    this._ProcessEntity(re, null)
+                }
+            }
+        }
+
         if (blockCtx) {
             //XXX handle indirect recursion
             if (blockCtx.name === entity.name) {
