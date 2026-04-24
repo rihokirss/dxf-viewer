@@ -1988,15 +1988,68 @@ export class DxfScene {
             }
         }
 
-        // Flatten bulges to straight segments for now. Bulged shaped
-        // polylines are rare in CADS output; re-use _GenerateBulgeVertices
-        // upstream if / when that changes.
+        function getSegmentWidth(a, b) {
+            const aw = widthAt(a)
+            const bw = widthAt(b)
+            return {
+                startW: aw.sw != null ? aw.sw : aw.ew != null ? aw.ew : bw.sw,
+                endW: bw.sw != null ? bw.sw : bw.ew != null ? bw.ew : aw.ew,
+            }
+        }
+
+        function makeWidthVertex(v, w) {
+            return {
+                ...v,
+                startWidth: w,
+                endWidth: w,
+            }
+        }
+
+        function interpolateWidth(startW, endW, t) {
+            if (!startW || !endW) return startW || endW
+            return startW + (endW - startW) * t
+        }
+
+        // Expand bulged centerline segments before shaping them into triangles.
+        // Otherwise a wide LWPOLYLINE arc is rendered as one straight segment.
         const segs = []
         for (let i = 0; i < n - 1; i++) {
-            segs.push([vertices[i], vertices[i + 1]])
+            const a = vertices[i]
+            const b = vertices[i + 1]
+            if (a.bulge) {
+                const {startW, endW} = getSegmentWidth(a, b)
+                const arcVertices = [{x: a.x, y: a.y}]
+                this._GenerateBulgeVertices(arcVertices, a, b, a.bulge)
+                for (let j = 0; j < arcVertices.length - 1; j++) {
+                    const ta = j / (arcVertices.length - 1)
+                    const tb = (j + 1) / (arcVertices.length - 1)
+                    segs.push([
+                        makeWidthVertex(arcVertices[j], interpolateWidth(startW, endW, ta)),
+                        makeWidthVertex(arcVertices[j + 1], interpolateWidth(startW, endW, tb)),
+                    ])
+                }
+            } else {
+                segs.push([a, b])
+            }
         }
         if (shape) {
-            segs.push([vertices[n - 1], vertices[0]])
+            const a = vertices[n - 1]
+            const b = vertices[0]
+            if (a.bulge) {
+                const {startW, endW} = getSegmentWidth(a, b)
+                const arcVertices = [{x: a.x, y: a.y}]
+                this._GenerateBulgeVertices(arcVertices, a, b, a.bulge)
+                for (let j = 0; j < arcVertices.length - 1; j++) {
+                    const ta = j / (arcVertices.length - 1)
+                    const tb = (j + 1) / (arcVertices.length - 1)
+                    segs.push([
+                        makeWidthVertex(arcVertices[j], interpolateWidth(startW, endW, ta)),
+                        makeWidthVertex(arcVertices[j + 1], interpolateWidth(startW, endW, tb)),
+                    ])
+                }
+            } else {
+                segs.push([a, b])
+            }
         }
 
         // Pick up segment widths. `startWidth` on the vertex applies to the
@@ -2012,13 +2065,10 @@ export class DxfScene {
         const indices = []
 
         for (const [a, b] of segs) {
-            const aw = widthAt(a)
-            const bw = widthAt(b)
             // Start width = a.startWidth (or fall back to a.endWidth or b.startWidth).
             // End width = b.startWidth (the NEXT segment's start is this segment's end).
             //   When unavailable, fall back to b.endWidth or a.endWidth.
-            let startW = aw.sw != null ? aw.sw : aw.ew != null ? aw.ew : bw.sw
-            let endW = bw.sw != null ? bw.sw : bw.ew != null ? bw.ew : aw.ew
+            let {startW, endW} = getSegmentWidth(a, b)
             if (!startW || !endW) {
                 // No usable width on either endpoint — skip this segment
                 // (upstream splitter usually catches this by checking
