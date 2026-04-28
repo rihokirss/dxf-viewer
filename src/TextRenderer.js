@@ -7,6 +7,41 @@ import {MTextFormatParser} from "./MTextFormatParser.js"
 /** Regex for parsing special characters in text entities. */
 const SPECIAL_CHARS_RE = /(?:%%([dpcou%]))|(?:\\U\+([0-9a-f]{4}))/gi
 
+/** Quick check + MTextFormatParser pass for TEXT entities that carry MText
+ * format codes in their group-1 payload. CADMATIC writes some annotation
+ * texts that way (the format directive ended up in a TEXT slot rather
+ * than an MTEXT one); without stripping them the curly braces and `\f…;`
+ * font directives render literally on the canvas.
+ *
+ * Plain text (no `{`, no leading `\`, no `\P`) bypasses the parse — the
+ * function returns the input unchanged. Return value is the concatenated
+ * visible text content with paragraph breaks turned into newlines.
+ */
+function stripMTextFormatCodes(text) {
+    if (typeof text !== "string" || text.length === 0) return text
+    if (text.indexOf("{") === -1 && text.indexOf("\\") === -1) return text
+    const parser = new MTextFormatParser()
+    parser.Parse(text)
+    const EntityType = MTextFormatParser.EntityType
+    const parts = []
+    function walk(items) {
+        for (const item of items) {
+            if (item.type === EntityType.TEXT) {
+                parts.push(item.content)
+            } else if (item.type === EntityType.SCOPE) {
+                walk(item.content)
+            } else if (item.type === EntityType.PARAGRAPH) {
+                parts.push("\n")
+            } else if (item.type === EntityType.NON_BREAKING_SPACE) {
+                parts.push(" ")
+            }
+        }
+    }
+    walk(parser.GetContent())
+    const out = parts.join("")
+    return out.length > 0 ? out : text
+}
+
 /**
  * Parse special characters in text entities and convert them to corresponding unicode
  * characters.
@@ -162,8 +197,20 @@ export class TextRenderer {
      */
     *Render({text, startPos, endPos, rotation = 0, widthFactor = 1, hAlign = 0, vAlign = 0,
              color, layer = null, fontSize}) {
+        // Strip MText format codes when present in a TEXT entity. CADMATIC
+        // occasionally writes MText-format payloads (e.g. `10{\fVerdana|
+        // b0|i0|c186;A}` on 3k-joud-B at off=390555) into the TEXT slot —
+        // without this strip the curly braces and font directives render
+        // literally, leaving "10{\fVerdana|...A}" visible on the canvas.
+        // The MText path's MTextFormatParser already knows how to extract
+        // the underlying text from the format codes; reuse it for the
+        // TEXT path so escape codes always come out as plain glyphs
+        // regardless of which entity type carries them. Plain TEXT
+        // (no `{\`, no `\P`, etc.) is unaffected — the parser yields a
+        // single TEXT chunk identical to the input.
+        const renderedText = stripMTextFormatCodes(text)
         const block = new TextBlock(fontSize)
-        for (const char of text) {
+        for (const char of renderedText) {
             const shape = this._GetCharShape(char)
             if (!shape) {
                 continue
