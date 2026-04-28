@@ -2069,10 +2069,16 @@ export class DxfScene {
             // End width = b.startWidth (the NEXT segment's start is this segment's end).
             //   When unavailable, fall back to b.endWidth or a.endWidth.
             let {startW, endW} = getSegmentWidth(a, b)
-            if (!startW || !endW) {
-                // No usable width on either endpoint — skip this segment
-                // (upstream splitter usually catches this by checking
-                // _IsPlainLine, but handle it defensively).
+            // Normalise to non-negative numbers; a tapered segment legitimately
+            // has one end at zero (arrow tip), so skip only when BOTH ends
+            // are zero/missing (truly invisible). Earlier the gate skipped
+            // any segment with a zero endpoint, which collapsed CADMATIC
+            // arrow polylines (e.g. SO_ITK_FUNK_VIIDE_v01 on SV1, where
+            // v0 carries startWidth=2 and endWidth=0) into either nothing or
+            // a constant-width fat line depending on the upstream normalize.
+            startW = startW > 0 ? startW : 0
+            endW = endW > 0 ? endW : 0
+            if (startW <= 0 && endW <= 0) {
                 continue
             }
 
@@ -2190,9 +2196,16 @@ export class DxfScene {
         }
         if (fallbackWidth > 0) {
             entityVertices = entityVertices.map(v => {
-                const sw = typeof v.startWidth === 'number' && v.startWidth > 0
+                // Preserve explicit zero widths — for tapered polylines (e.g.
+                // CADMATIC arrow blocks where v0 carries startWidth=2.0 and
+                // endWidth=0.0) the zero IS the intent ("taper to a point")
+                // and must not be replaced with the polyline-wide fallback.
+                // Only fill in when the value is genuinely missing
+                // (typeof !== 'number'), preserving downstream-vertex
+                // fallback behaviour for uniform-width polylines.
+                const sw = typeof v.startWidth === 'number'
                     ? v.startWidth : fallbackWidth
-                const ew = typeof v.endWidth === 'number' && v.endWidth > 0
+                const ew = typeof v.endWidth === 'number'
                     ? v.endWidth : fallbackWidth
                 return { ...v, startWidth: sw, endWidth: ew }
             })
