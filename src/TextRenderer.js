@@ -1062,14 +1062,23 @@ class TextBlock {
             origin.x = this.bounds.xMin
             break
         case HAlign.CENTER:
-            origin.x = (this.bounds.xMax - this.bounds.xMin) / 2
+            // Midpoint of the horizontal extent. xMin can be non-zero
+            // when the first glyph's left side bearing is negative
+            // (italic, kerning); use (xMax + xMin) / 2 for the actual
+            // midpoint instead of half-width.
+            origin.x = (this.bounds.xMax + this.bounds.xMin) / 2
             break
         case HAlign.RIGHT:
             origin.x = this.bounds.xMax
             break
         case HAlign.MIDDLE:
-            origin.x = (this.bounds.xMax - this.bounds.xMin) / 2
-            origin.y = (this.bounds.yMax - this.bounds.yMin) / 2
+            // Midpoint of both extents. The y-component used to read
+            // (yMax - yMin) / 2 (half-HEIGHT), which collapses to the
+            // midpoint only when yMin=0. Glyph bounds carry negative
+            // yMin for descenders/accents, and on those glyphs the
+            // half-height formula renders the text shifted up by |yMin|.
+            origin.x = (this.bounds.xMax + this.bounds.xMin) / 2
+            origin.y = (this.bounds.yMax + this.bounds.yMin) / 2
             break
         case HAlign.ALIGNED: {
             const f = GetFitScale()
@@ -1093,7 +1102,13 @@ class TextBlock {
             origin.y = this.bounds.yMin
             break
         case VAlign.MIDDLE:
-            origin.y = (this.bounds.yMax - this.bounds.yMin) / 2
+            // Midpoint of the text's vertical extent. Glyph bounds carry
+            // negative yMin for descenders (g/p/j/y) and Estonian/Polish
+            // accents that drop below baseline; (yMax - yMin) / 2 is the
+            // half-HEIGHT, not the midpoint, and renders descender-bearing
+            // text shifted upward by `|yMin|` from where the DXF says it
+            // should sit. (yMax + yMin) / 2 is the actual midpoint.
+            origin.y = (this.bounds.yMax + this.bounds.yMin) / 2
             break
         case VAlign.TOP:
             origin.y = this.bounds.yMax
