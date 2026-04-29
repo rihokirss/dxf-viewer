@@ -839,14 +839,28 @@ export class DxfScene {
 
         //XXX lookup font style attributes
 
+        // Field-name compatibility shim. dxf-parser produces ATTRIB
+        // entities with `horizontalJustification` / `verticalJustification`
+        // (DXF group 72/74). The DRW-derived path emits the canonical
+        // `halign` / `valign` names that the TEXT renderer at
+        // `_DecomposeText` already reads. Without this fallback, ATTRIBs
+        // fed in via the DRW path render LEFT/BASELINE regardless of
+        // the values we carry — visible on CADMATIC floor-plan symbols
+        // (STPRYH101PV E_ELPOSID="8KJK50" etc. with vAlign=Centerline /
+        // hAlign=Center missed the center-middle anchor).
+        const hAlign = entity.horizontalJustification ?? entity.halign
+        const vAlign = entity.verticalJustification ?? entity.valign
+        const widthFactor = entity.xScale ?? entity.scale ?? 1
+
         yield* this.textRenderer.Render({
             text: ParseSpecialChars(entity.text),
-            fontSize: entity.textHeight * entity.scale,
+            fontSize: entity.textHeight * (entity.scale ?? 1),
             startPos: entity.startPoint,
             endPos: entity.endPoint,
             rotation: entity.rotation,
-            hAlign: entity.horizontalJustification,
-            vAlign: entity.verticalJustification,
+            hAlign,
+            vAlign,
+            widthFactor,
             color,
             layer
         })
