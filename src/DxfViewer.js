@@ -534,7 +534,19 @@ export class DxfViewer {
         const src = this.simpleColorMaterial[instanceType]
         /* Should reuse compiled shaders. */
         const m = src.clone()
-        m.uniforms.color = { value: new three.Color(color) }
+        /* RawShaderMaterial bypasses Three.js's automatic linear→sRGB
+         * conversion at the renderer's outputColorSpace stage. Since
+         * Three r152 colour management is on by default and
+         * `new THREE.Color(hex)` interprets the hex as sRGB then stores
+         * the linear-RGB tristimulus values internally — the shader
+         * would otherwise write linear floats into an sRGB-tagged
+         * canvas, darkening every colour (e.g. ACI 30 0xFF7F00 displays
+         * as ~0xFF3600 vermillion instead of orange). Pre-encode the
+         * uniform back into sRGB so the shader output matches the
+         * canvas colour space without going through outputColorSpace. */
+        const c = new three.Color(color)
+        c.convertLinearToSRGB()
+        m.uniforms.color = { value: c }
         return m
     }
 
@@ -580,7 +592,12 @@ export class DxfViewer {
         const src = this.simplePointMaterial[instanceType]
         /* Should reuse compiled shaders. */
         const m = src.clone()
-        m.uniforms.color = { value: new three.Color(color) }
+        /* See _CreateSimpleColorMaterialInstance for the rationale —
+         * pre-encode linear→sRGB so RawShaderMaterial output matches
+         * the sRGB-tagged canvas. */
+        const c = new three.Color(color)
+        c.convertLinearToSRGB()
+        m.uniforms.color = { value: c }
         m.uniforms.size = { value: size }
         return m
     }
